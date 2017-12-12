@@ -1,0 +1,130 @@
+#!/usr/bin/python -u
+#
+# CS3700, Spring 2015
+# Project 2 Starter Code
+# Send
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+MSG_SIZE = 1500
+DATA_SIZE = 1000
+TIMEOUT = .5
+SEQUENCE = 0
+LAST_HEARD = time.time()
+
+# Bind to localhost and an ephemeral port
+IP_PORT = sys.argv[1]
+UDP_IP = IP_PORT[0:IP_PORT.find(":")]
+UDP_PORT = int(IP_PORT[IP_PORT.find(":") + 1:])
+dest = (UDP_IP, UDP_PORT)
+
+# SETUP window size, constant first
+WINDOW_SIZE = 5
+# SETUP Data dictionary
+dict = {}
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(TIMEOUT)
+
+def log(string):
+    sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+# Read file data
+def readData():
+    global dict
+    i = 0
+    # loop till the end of the file,
+    # Store everything in a local dictionary
+    while True:
+        data = sys.stdin.read(DATA_SIZE)
+        dict[SEQUENCE + i * DATA_SIZE] = [data,False]
+        i += 1
+        if len(data) <= 0:
+            log("[EOF with file size]" + str(len(dict)))
+            break
+
+# find the lowest unsent packet:
+def checkUnsent():
+    global SEQUENCE
+    global curr_window_index
+    missing_keys = []
+    for key in dict:
+        if not dict[key][1]:
+            log('[my missing key: ]' + str(key))
+            missing_keys.append(key)
+    SEQUENCE = min(missing_keys)
+    curr_window_index = 0
+    send_next_packet()
+
+def send_next_packet():
+    global SEQUENCE
+    global WINDOW_SIZE
+    # loop for window size
+    j = 0
+    while j < WINDOW_SIZE:
+        dictStr = dict[SEQUENCE][0]
+        if dictStr != '':
+            msg = json.dumps({"sequence": SEQUENCE, "data": dictStr,
+                 "ack": False, "eof": False, "window_size": WINDOW_SIZE, "length": DICT_LENGTH})
+            SEQUENCE += len(dictStr)
+            j += 1
+            if sock.sendto(msg, dest) < len(msg):
+                log("[error] unable to fully send packet")
+            else:
+                log("[send data] " + str(SEQUENCE) + " (" + str(len(dictStr)) + ")")
+        else:
+            sock.sendto(
+                json.dumps({"eof": True, "data": "", "sequence": SEQUENCE, "ack": False, "window_size": WINDOW_SIZE, "length": DICT_LENGTH}),
+                dest)
+            break
+
+# Send first packet
+readData()
+DICT_LENGTH = len(dict)
+# corrupted = False
+# foundMaximumSize = False
+send_next_packet()
+curr_window_index = 0
+
+# Now read in data, send packets
+while True:
+    log("ABOUT TO SLEEP")
+    try:
+        result = sock.recvfrom(MSG_SIZE)
+    except (socket.timeout, socket.error) as err:
+        if time.time() - LAST_HEARD > 5:
+            sys.exit(0)
+        checkUnsent()
+        continue
+    if result:
+        (data, addr) = result
+        LAST_HEARD = time.time()
+        try:
+            decoded = json.loads(data)
+            if decoded['eof']:
+                sys.exit(0)
+            # If there is an ack, send next packet
+            ack = decoded['ack']
+            dict[ack-DATA_SIZE][1] = True
+            curr_window_index += 1
+            if curr_window_index == WINDOW_SIZE:
+                curr_window_index = 0
+                # if not corrupted and not foundMaximumSize:
+                #     WINDOW_SIZE += 1
+                send_next_packet()
+        except (ValueError, KeyError, TypeError):
+            log("[recv corrupt packet sender side]")
+            # corrupted = True
+            # foundMaximumSize = True
+            # WINDOW_SIZE -= 1
+            # checkUnsent()
+            continue
+    else:
+        log("[error] timeout")
+        sys.exit(-1)

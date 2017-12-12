@@ -1,0 +1,312 @@
+#!/usr/bin/env python
+import sys, socket, select, time, json, random, thread
+
+def log(data):
+    # return
+    print(data)
+
+class Replica:
+    def __init__(self, my_id, replica_ids):
+        self.my_id = my_id
+        self.replica_ids = sys.argv[2:]
+        self.majority_count = len(replica_ids) / 2
+        self.leader_id = 'FFFF'
+        self.is_leader = False
+        self.term_num = 0
+        self.my_votes = set()
+        self.sent_vote = False
+        self.heartbeat_rate = 0.17
+        self.uncommited_msgs = {}
+        self.data_table = {}
+        self.vote_log = {}
+        self.next_heartbeat_time = time.time() + self.heartbeat_rate
+        self.election_timeout = self.random_timeout()
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self.sock.connect(self.my_id)
+        self.start_time = time.time()
+        self.election_holding = self.random_vote_timeout()
+        self.redirect_queue = []
+        self.buffer = {}
+
+    def send(self, msg):
+        self.sock.send(json.dumps(msg))
+
+    def send_pulse(self, msg):
+        self.next_heartbeat_time = time.time() + self.heartbeat_rate
+        for replica_id in self.replica_ids:
+            msg['dst'] = replica_id
+            self.send(msg)
+
+    def random_vote_timeout(self):
+        return time.time() + (float(random.randrange(800, 1200, 1)) / 1000)
+
+    def random_timeout(self):
+        return time.time() + (float(random.randrange(150, 300, 1)) / 100 * self.heartbeat_rate * 2.0)
+
+    def has_quorum(self, votes, val):
+        vote_count = 0
+        for replica_id in votes:
+            if votes[replica_id] == val:
+                vote_count += 1
+        return vote_count > self.majority_count
+
+    def clear_redirect_queue(self):
+        log(('clear_redirect_queue to', self.leader_id))
+        while self.redirect_queue:
+            msg = self.redirect_queue.pop()
+            self.send({'src': self.my_id,
+                  'term_num': self.term_num,
+                  'dst': msg['src'],
+                  'leader': self.leader_id,
+                  'type': 'redirect',
+                  'MID': msg['MID']})
+
+    def follower_actions(self, msg):
+        if msg['src'] not in self.replica_ids and msg['type'] in ['get', 'put']:
+            # log(('redirect', msg['MID'], 'from ', self.my_id, 'to', self.leader_id))
+            # self.uncommited_msgs[msg['MID']] = (msg, time.time())
+
+            if self.leader_id == 'FFFF':
+                self.buffer[msg['MID']] = msg
+            else:
+                self.send({'src': self.my_id,
+                      'term_num': self.term_num,
+                      'dst': msg['src'],
+                      'leader': self.leader_id,
+                      'type': 'redirect',
+                      'MID': msg['MID']})
+                self.redirect_queue.append(msg)
+            return
+
+        # if msg['src'] != self.leader_id and self.last_check > 2:
+        #     self.sent_vote = False
+        # else:
+        #     self.last_check = time.time()
+
+        self.election_timeout = self.random_timeout()
+        if msg['type'] == 'heart_beat':
+            self.is_leader = False
+            self.leader_id = msg['src']
+            # self.sent_vote = False
+            self.my_votes = set()
+            for mid, msg in self.buffer.items():
+                self.send({'src': self.my_id,
+                      'term_num': self.term_num,
+                      'dst': msg['src'],
+                      'leader': self.leader_id,
+                      'type': 'redirect',
+                      'MID': msg['MID']})
+            self.buffer = {}
+        elif msg['type'] == 'put':
+            self.uncommited_msgs[msg['MID']] = (msg, time.time())
+            self.send({'src': self.my_id,
+                  'term_num': self.term_num,
+                  'dst': msg['src'],
+                  'leader': self.leader_id,
+                  'type': 'ok-put',
+                  'MID': msg['MID'],
+                  'key': msg['key'],
+                  'value': msg['value']})
+        elif msg['type'] == 'get':
+            value = self.data_table.get(msg['key'], None)
+            most_recent = 0
+            for key, tup in self.uncommited_msgs.items():
+                uncommited_msg, timestamp = tup
+                if uncommited_msg['key'] == msg['key']:
+                    if most_recent < timestamp:
+                        most_recent = timestamp
+                        value = uncommited_msg['value']
+            self.send({'src': self.my_id,
+                  'term_num': self.term_num,
+                  'dst': msg['src'],
+                  'leader': self.leader_id,
+                  'type': 'ok-get',
+                  'MID': msg['MID'],
+                  'key': msg['key'],
+                  'value': value})
+        elif msg['type'] == 'confirm':
+            if msg['MID'] in self.uncommited_msgs:
+                commiting_msg, timestamp = self.uncommited_msgs.pop(msg['MID'], (None, None))
+                self.data_table[commiting_msg['key']] = commiting_msg['value']
+        elif msg['type'] == 'vote_request':
+            if not self.sent_vote:
+                # log((self.my_id, 'vote for', msg['src']))
+                self.sent_vote = True
+                self.term_num = msg['term_num']
+                self.leader_id = 'FFFF'
+                self.send({'src': self.my_id,
+                      'term_num': self.term_num,
+                      'dst': msg['src'],
+                      'leader': self.leader_id,
+                      'type': 'vote'})
+        elif msg['type'] == 'vote':
+            self.my_votes.add(msg['src'])
+            if len(self.my_votes) > self.majority_count and not self.is_leader:
+                # log(('become leader: ', self.my_id, self.my_votes))
+                self.is_leader = True
+                self.leader_id = self.my_id
+                for mid, msg in self.buffer.items():
+                    self.leader_action(msg)
+                self.buffer = {}
+                # for mid, tup in self.uncommited_msgs.items():
+                #     msg, timestamp = tup
+                #     self.leader_action(msg)
+                # self.uncommited_msgs = {}
+        elif msg['type'] == 'heal_put':
+            self.data_table[msg['key']] = msg['value']
+            # self.election_timeout = self.random_timeout()
+            self.leader_id = msg['leader']
+
+    def leader_action(self, msg):
+        if msg['type'] == 'put':
+            msg['term_num'] = self.term_num
+            self.uncommited_msgs[msg['MID']] = (msg, time.time())
+            self.vote_log[msg['MID']] = { self.my_id: msg['value'] }
+            self.send_pulse({
+                'term_num': self.term_num,
+                'src': self.my_id,
+                'leader': self.leader_id,
+                'type': 'put',
+                'MID': msg['MID'],
+                'key': msg['key'],
+                'value': msg['value']})
+        elif msg['type'] == 'get':
+            msg['term_num'] = self.term_num
+            self.uncommited_msgs[msg['MID']] = (msg, time.time())
+            self.vote_log[msg['MID']] =  { self.my_id: self.data_table.get(msg['key'], None) }
+            self.send_pulse({
+                'term_num': self.term_num,
+                'src': self.my_id,
+                'leader': self.leader_id,
+                'type': 'get',
+                'MID': msg['MID'],
+                'key': msg['key']})
+        elif msg['type'] == 'ok-put':
+            votes = self.vote_log.get(msg['MID'], {})
+            votes[msg['src']] = msg['value']
+            if self.has_quorum(votes, msg['value']) and msg['MID'] in self.uncommited_msgs.keys():
+                commiting_msg, timestamp = self.uncommited_msgs.pop(msg['MID'], (None, None))
+                self.data_table[msg['key']] = commiting_msg['value']
+                # log(('ok-put', self.my_id, msg['MID'], msg['key'], msg['value'], votes.keys()))
+                self.send({'src': self.my_id,
+                      'term_num': self.term_num,
+                      'dst': commiting_msg['src'],
+                      'leader': self.leader_id,
+                      'type': 'ok',
+                      'MID': commiting_msg['MID']})
+                self.send_pulse({
+                        'term_num': self.term_num,
+                        'src': self.my_id,
+                        'leader': self.leader_id,
+                        'type': 'confirm',
+                        'MID': commiting_msg['MID']})
+        elif msg['type'] == 'ok-get':
+            votes = self.vote_log.get(msg['MID'], {})
+            votes[msg['src']] =  msg['value']
+            if self.has_quorum(votes,  self.data_table.get(msg['key'])) and msg['MID'] in self.uncommited_msgs.keys():
+                commiting_msg, timestamp = self.uncommited_msgs.pop(msg['MID'], (None, None))
+                # log(('ok-get', self.my_id, msg['MID'], msg['key'],  msg['value'], votes.keys()))
+                self.send({'src': self.my_id,
+                      'term_num': self.term_num,
+                      'dst': commiting_msg['src'],
+                      'leader': self.leader_id,
+                      'type': 'ok',
+                      'MID': msg['MID'],
+                      'value': msg['value']})
+        elif msg['type'] == 'heal_me':
+            for key, value in self.data_table.items():
+                self.send({
+                    'term_num': self.term_num,
+                    'src': self.my_id,
+                    'dst': msg['src'],
+                    'leader': self.leader_id,
+                    'type': 'heal_put',
+                    'key': key,
+                    'value': value})
+
+    def heal_partition(self, msg):
+        self.election_timeout = self.random_timeout()
+        # log((self.my_id, 'should heal', self.term_num, msg['term_num'], self.leader_id, msg['leader'], msg['type'], self.election_timeout - self.start_time))
+        self.term_num = msg['term_num']
+        self.uncommited_msgs = {}
+        self.vote_log = {}
+        self.is_leader = False
+        self.my_votes = set()
+        self.leader_id = msg['leader']
+        self.send({'src': self.my_id,
+              'term_num': self.term_num,
+              'dst': msg['leader'],
+              'leader': self.leader_id,
+              'type': 'heal_me'})
+
+    def recieve_messages(self):
+        while True:
+            msg = json.loads(self.sock.recv(32768))
+            if msg['src'] in self.replica_ids and msg['type'] != 'vote_request' and msg['leader'] != 'FFFF' and (self.term_num < msg['term_num'] or (self.term_num > msg['term_num'] and self.leader_id == 'FFFF')):
+                self.heal_partition(msg)
+            elif self.is_leader:
+                self.leader_action(msg)
+            else:
+                self.follower_actions(msg)
+
+    def election_timer(self):
+        while True:
+            ready = select.select([self.sock], [], [], 0.1)[0]
+            if self.sock in ready:
+                clock = time.time()
+                if clock > self.election_timeout and not self.is_leader:
+                    self.election_timeout = self.random_vote_timeout()
+                    # self.election_holding =
+                    self.my_votes.clear()
+                    self.is_leader = False
+                    self.my_votes.add(self.my_id)
+                    self.sent_vote = False
+                    self.term_num += 1
+                    self.leader_id = 'FFFF'
+                    # log(('timeout', self.my_id, time.time() - self.start_time, self.term_num))
+                    self.send_pulse({
+                         'term_num': self.term_num,
+                         'src': self.my_id,
+                         'leader': self.leader_id,
+                         'type': 'vote_request'})
+                elif self.is_leader and clock >= self.next_heartbeat_time:
+                    self.send_pulse({
+                        'term_num': self.term_num,
+                        'src': self.my_id,
+                        'leader': self.leader_id,
+                        'type': 'heart_beat'})
+                elif self.is_leader:
+                    for key, tup in self.uncommited_msgs.items():
+                        msg, timestamp = tup
+                        if time.time() > timestamp + 0.25:
+                            #log(('resend', key))
+                            # self.uncommited_msgs.pop(key, None)
+                            # self.redirect_queue.append(msg)
+                            self.uncommited_msgs.pop(key, None)
+                            self.send({'src': self.my_id,
+                                  'term_num': self.term_num,
+                                  'dst': msg['src'],
+                                  'leader': self.leader_id,
+                                  'type': 'redirect',
+                                  'MID': msg['MID']})
+                # if self.leader_id != 'FFFF' and self.redirect_queue:
+                #     self.clear_redirect_queue()
+                            #
+                            #
+                            #
+                            # new_msg = {
+                            #     'term_num': self.term_num,
+                            #     'src': self.my_id,
+                            #     'leader': self.leader_id,
+                            #     'type': msg['type'],
+                            #     'MID': msg['MID'],
+                            #     'key': msg['key']}
+                            # if msg['type'] == 'put':
+                            #     new_msg['value'] = msg['value']
+                            # self.send_pulse(new_msg)
+                            # self.uncommited_msgs[key] = (msg, time.time())
+
+
+replica = Replica(sys.argv[1], sys.argv[2:])
+thread.start_new_thread(replica.election_timer, ())
+replica.recieve_messages()

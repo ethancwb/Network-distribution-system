@@ -1,0 +1,92 @@
+#!/usr/bin/python -u
+#
+# CS3700, Spring 2015
+# Project 2 Starter Code
+# Receive
+
+import sys
+import socket
+import time
+import datetime
+import select
+import json
+
+def log(string):
+    sys.stderr.write(datetime.datetime.now().strftime("%H:%M:%S.%f") + " " + string + "\n")
+
+MSG_SIZE = 1500
+TIMEOUT = .5
+
+# Bind to localhost and an ephemeral port
+UDP_IP = "127.0.0.1"
+UDP_PORT = 0
+
+# Set up the socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.bind((UDP_IP, UDP_PORT))
+sock.settimeout(TIMEOUT)
+
+# Get port we bound to
+UDP_PORT = sock.getsockname()[1]
+log("[bound] " + str(UDP_PORT))
+
+# Dictionary for file sequence
+packetDict = {}
+# End flag
+end = False
+
+def printPacketInorder():
+    global packetDict
+    while len(packetDict) != 0:
+        keys = packetDict.keys()
+        sys.stdout.write(packetDict[min(keys)])
+        del packetDict[min(keys)]
+
+# Now listen for packets
+while True:
+    try:
+        result = sock.recvfrom(MSG_SIZE)
+    except (socket.timeout, socket.error) as err:
+        log("Server socket receive error")
+        continue
+    # If nothing is ready, we hit the timeout
+    if result:
+        (data, addr) = result
+        try:
+            decoded = json.loads(data)
+            # SequenceNum from sender
+            sequenceNum = decoded['sequence']
+            # Data from sender
+            recvData = decoded['data']
+            # Window size
+            WindowSize = decoded['window_size']
+            # if we have seen eof before, permanently overwrite the flag
+            if decoded['eof'] :
+                end = True
+            # If the EOF flag is set and we already received all the data, then exit
+            if end and len(packetDict) == decoded['length'] - 1:
+                log("[completed ]" + str(len(packetDict)))
+                msg = json.dumps({'eof': True})
+                sock.sendto(msg, addr)
+                printPacketInorder()
+                sys.exit(0)
+            # If there is data, we accept it and print it out
+            if recvData:
+                # Check if we have seen this data before
+                if sequenceNum not in packetDict.keys():
+                    packetDict[sequenceNum] = recvData
+                # Send back an ack to the sender when getting a packet
+                log("[recv data] " + str(sequenceNum) + " (" + str(len(recvData)) + ") ACCEPTED")
+                msg = json.dumps({"ack": sequenceNum + len(recvData), 'eof': False})
+                log("ABOUT TO SEND " + msg)
+                if sock.sendto(msg, addr) < len(msg):
+                    log("[error] unable to fully send packet")
+        except (ValueError, KeyError, TypeError) as e:
+            log("[recv corrupt packet]")
+            # msg = 'gasdfadsfasd'
+            # sock.sendto(msg, addr)
+            raise e
+    else:
+        log("[error] timeout")
+        sys.exit(-1)
+        # store packet in buffer then print out them in order at the same time?

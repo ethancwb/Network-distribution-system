@@ -1,0 +1,231 @@
+#!/usr/bin/python -u
+#
+# CS3700, Fall 2017
+# Project 4
+# Web Crawler
+import socket
+import sys
+from urlparse import urlparse
+from HTMLParser import HTMLParser
+from StringIO import StringIO
+
+# initial login info
+loginForm = {
+    'username': '1125638',
+    'password': 'R1XCGMUJ'
+}
+
+# session info
+sessionForm = {
+    'cookie': '',
+    'csrfmiddlewaretoken': ''
+}
+
+Initial_Page = "fring.ccs.neu.edu"
+
+
+# Easy implementation of data structure Queue
+class Queue:
+    def __init__(self):
+        self.list = []
+
+    def push(self, item):
+        self.list.insert(0, item)
+        temp = set(self.list)
+        self.list = list(temp)
+
+    def pop(self):
+        return self.list.pop()
+
+    def isEmpty(self):
+        return len(self.list) == 0
+
+    def printElements(self):
+        print self.list
+
+
+# Customized parser
+class MyParser(HTMLParser):
+    def __init__(self):
+        self.hrefList = set()
+        self.secretKey = []
+        self.secret = False
+        HTMLParser.__init__(self)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            for name, value in attrs:
+                if name == "href":
+                    if not 'http' in value and not '@' in value:
+                        self.hrefList.add(value)
+        else:
+            for name, value in attrs:
+                if name == 'class' and value == 'secret_flag':
+                    self.secret = True
+    # return secret keys
+    def getKeys(self):
+        return self.secretKey
+    # get all links to other sites
+    def getLinks(self):
+        return self.hrefList
+    # handle secret key data
+    def handle_data(self, data):
+        if self.secret:
+            print data
+            self.secret = False
+            self.secretKey.append(data)
+
+
+# parse header info
+def parseHeader(data):
+    if "HTTP/1.1" in data:
+        result = data.split('\r\n\r\n', 2)[0]
+        result = result.split('\r\n')
+        dict = {
+            'status': int(result[0].split(' ')[1]),
+            'Connection': None,
+            'Set-Cookie': None,
+            'location': None
+        }
+        for str in result:
+            if 'Connection' in str:
+                ans = str.split(': ')[1]
+                dict['Connection'] = ans[:len(ans)]
+            if 'Set-Cookie' in str:
+                curr_val = dict['Set-Cookie']
+                ans = str.split(': ')[1]
+                read = ans[:len(ans) - 1]
+                if curr_val == None:
+                    dict['Set-Cookie'] = read
+                else:
+                    curr_val += '; ' + read
+                    dict['Set-Cookie'] = curr_val
+            if 'Location' in str:
+                ans = str.split(': ')[1]
+                dict['location'] = ans[:len(ans) - 1]
+        return dict
+    return None
+
+
+# Take in method('GET','POST','PUT','REMOVE) and address
+# and generates request string
+def setRequest(method, addr):
+    global firstSend, loggedIn
+
+    requestString = method + ' ' + addr + ' HTTP/1.1\r\n' \
+                    + 'Host: ' + Initial_Page + '\r\n'
+
+    if loggedIn:
+        requestString = appendCSRFandCookie(requestString)
+
+    if method == 'POST' and not loggedIn:
+        username = loginForm['username']
+        password = loginForm['password']
+        requestString = appendCSRFandCookie(requestString)
+        requestString += 'Content-Length: 107\r\nContent-Type:application/x-www-form-urlencoded\r\n'
+        requestString += '\r\n' + 'username=' + username + '&password=' + password + '&csrfmiddlewaretoken=' + \
+                         sessionForm['csrfmiddlewaretoken'] \
+                         + '&next=%2Ffakebook%2F' + '\r\n'
+        loggedIn = True
+
+    requestString += '\r\n'
+
+    return requestString
+
+# helper function for generating cookies
+def appendCSRFandCookie(string):
+    csrf = sessionForm['csrfmiddlewaretoken']
+    cookie = sessionForm['cookie']
+    string += 'Cookie: csrftoken=' + csrf + \
+              '; sessionid=' + cookie + '\r\n'
+    return string
+
+# initialize variables
+parser = MyParser()
+url_queue = Queue()
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect((Initial_Page, 80))
+visited = set()
+firstSend = True
+loggedIn = False
+Sent = False
+restart = False
+
+# start with root
+url_queue.push("/")
+
+# read from command line
+if len(sys.argv) == 3:
+    loginForm['username'] = sys.argv[1]
+    loginForm['password'] = sys.argv[2]
+
+# main loop
+while not url_queue.isEmpty():
+    # if seen 5 flags, print and quit
+    if len(parser.getKeys()) == 5:
+        sys.exit(0)
+    # if connection close or 500, reconnect socket
+    if restart:
+        sock.close()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.connect((Initial_Page, 80))
+        restart = False
+
+    curr_page = url_queue.pop()
+    parsedURL = urlparse(curr_page)
+
+    # if no message got sent
+    if not Sent:
+        request = setRequest('GET', curr_page)
+        sock.sendall(request)
+
+    Sent = False
+    data = sock.recv(4096)
+
+    # Get status code
+    header = parseHeader(data)
+
+    # handle different status codes
+    if header != None:
+        if header['Connection'] == 'close':
+            restart = True
+            continue
+        if header['Set-Cookie']:
+            cookieHeader = header['Set-Cookie']
+            splitedString = cookieHeader.split(';', 1)
+            for s in splitedString:
+                if 'csrftoken' in s:
+                    sessionForm['csrfmiddlewaretoken'] = s.split('=', 1)[1]
+                if 'sessionid' in s:
+                    index = s.find('sessionid')
+                    index += len('sessionid=')
+                    sessionForm['cookie'] = s[index: (index + 32)]
+
+        if header['status'] == 403 or header['status'] == 404:
+            visited.add(curr_page)
+            continue
+
+        if header['status'] == 500:
+            restart = True
+            url_queue.push(curr_page)
+            continue
+
+        if header['status'] == 302:
+            url_queue.push(header['location'])
+            visited.add(curr_page)
+            continue
+
+    # Parse content
+    parser.feed(data)
+    visited.add(curr_page)
+    # Push to queue
+    for address in parser.getLinks():
+        if address not in visited:
+            url_queue.push(address)
+
+    if parsedURL.path == '/accounts/login/' and not loggedIn:
+        request = setRequest('POST', '/accounts/login/')
+        sock.sendall(request)
+        Sent = True
+        url_queue.push('/fakebook/')
+        visited.add(curr_page)
